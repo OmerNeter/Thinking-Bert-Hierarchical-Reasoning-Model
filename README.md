@@ -35,7 +35,7 @@ graph TD
 
 ```mermaid
 graph TD
-    A[Input: "The capital of France is <MASK>."] --> B{Tokenization};
+    A[Input: The capital of France is <MASK>] --> B{Tokenization};
     B --> C{Locate Mask Index};
     C --> D{Pad to Max Length};
     D --> E[Prepare Tensors: input_ids, attention_mask, token_type_ids];
