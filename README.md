@@ -35,23 +35,19 @@ graph TD
 
 ```mermaid
 graph TD
-    A[Input: The capital of France is <MASK>] --> B{Tokenization};
-    B --> C{Locate Mask Index};
-    C --> D{Pad to Max Length};
-    D --> E[Prepare Tensors: input_ids, attention_mask, token_type_ids];
-    E --> F{model(..., N, T)};
+    A["Input: 'The capital of France is <MASK>.'"] --> B["Tokenization"];
+    B --> C["Locate Mask Index"];
+    C --> D["Pad to Max Length"];
+    D --> E["Prepare Tensors"];
+    E --> F["model(..., N, T)"];
 
-    subgraph "HierarchicalBert Model Inference"
-        F --> G[Iterative Pondering (N steps)];
-        G --> H[Final Logits List];
+    subgraph "Model Inference"
+        F --> G["Iterative Pondering (N steps)"];
+        G --> H["Get Final Logits"];
     end
 
-    H --> I{Select Final Logits};
-    I --> J{Extract Logits at Mask Index};
-    J --> K{Find Highest Logit (Argmax)};
-    K --> L[Decode Predicted Token ID];
-    L --> M[Output: "The capital of France is Paris."];
-
-    style A fill:#f9f,stroke:#333,stroke-width:2px
-    style M fill:#bbf,stroke:#333,stroke-width:2px
+    H --> I["Extract Logits at Mask Index"];
+    I --> J["Find Highest Logit (Argmax)"];
+    J --> K["Decode Predicted Token ID"];
+    K --> L["Output: 'The capital of France is Paris.'"];
 ```
