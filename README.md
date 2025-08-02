@@ -33,6 +33,8 @@ graph TD
     end
 ```
 
+## ⚙️ Model Information Flow: Inference
+
 ```mermaid
 graph TD
     A["Input: 'The capital of France is <MASK>.'"] --> B["Tokenization"];
