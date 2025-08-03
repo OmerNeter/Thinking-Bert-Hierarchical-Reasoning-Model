@@ -53,3 +53,12 @@ graph TD
     J --> K["Decode Predicted Token ID"];
     K --> L["Output: 'The capital of France is Paris.'"];
 ```
+
+## ⚙️ Benchmarks
+
+## ⚙️ Different Sizes models
+
+## ⚙️ Multi token prediction
+
+## ⚙️ Hardware requirements
+
