@@ -1,201 +1,1326 @@
-                                 Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+import type { Plugin, Hooks } from "@opencode-ai/plugin"
+import { tool } from "@opencode-ai/plugin"
+import { mkdir, writeFile, readFile, readdir, appendFile, rename } from "fs/promises"
+import { join, basename } from "path"
+import { Buffer } from "node:buffer"
 
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+// ============================================================================
+// Tunables
+// ============================================================================
+const ARCHIVE_THRESHOLD_PCT = 0.45
+const MIN_ARCHIVE_GAIN_PCT = 0.10
+const PROTECTED_TAIL_TURNS = 6
+const MIN_PROTECTED_TURNS = 2
+const MAX_PART_PCT_OF_LIMIT = 0.45
+const MAX_PART_ABS_TOKENS = 80_000
+const CHARS_PER_TOKEN = 3.0
+const MESSAGE_OVERHEAD = 20
+const EMERGENCY_TARGET_PCT = 0.80
+const RUNNING_SUMMARY_MAX_CHARS = 6000
+const SECTION_MAX_ENTRIES = 14
+const MAX_RETRIEVE_CHARS_DEFAULT = 80_000
+const MAX_RETRIEVE_CHARS_HARD = 250_000
+const MAX_INDEX_SHOWN = 60
+const MAX_INDEX_SHOWN_IN_NOTICE = 20
+const MAX_CONTINUATIONS = 8
+const CONT_DELAY_MS = 350
+const CONT_API_FALLBACK_CHARS = 8000
+const MAX_READS_PER_TURN = 5
+const ARCHIVE_SUBDIR = ".opencode/context"
+const INDEX_FILE = "index.json"
+const STATE_FILE = "state.json"
+const MAX_AUTO_RETRIEVAL_RESULTS = 5
+const AUTO_RETRIEVAL_MAX_CHARS = 18_000
+const MAX_CHUNK_KEYWORDS = 36
+const MAX_SEARCH_EXCERPT_CHARS = 900
+const MAX_LIVE_TOOL_PREVIEW_CHARS = 24_000
+const MAX_LIVE_TEXT_PREVIEW_CHARS_FLOOR = 4_000
 
-   1. Definitions.
+// ============================================================================
+// Types
+// ============================================================================
+interface Message { info: any; parts: any[] }
+interface IndexEntry {
+  file: string
+  summary: string
+  files: string[]
+  tools: string[]
+  msgCount: number
+  ts: string
+  sessionID?: string
+  hidden?: boolean
+  kind?: "chunk" | "discovery" | "overflow" | "continuation"
+  keywords: string[]
+}
+interface SearchHit { entry: IndexEntry; score: number; reasons: string[] }
+interface PersistedState {
+  version: number
+  chunkCounter: number
+  boundaries: Record<string, string>
+  runningSummaries: Record<string, string>
+}
 
-      "License" shall mean the terms and conditions for use, reproduction,
-      and distribution as defined by Sections 1 through 9 of this document.
+// ============================================================================
+// Token estimation and safe stringify
+// ============================================================================
+function est(text: string | undefined | null): number {
+  if (!text) return 0
+  return Math.ceil(String(text).length / CHARS_PER_TOKEN)
+}
 
-      "Licensor" shall mean the copyright owner or entity authorized by
-      the copyright owner that is granting the License.
+function safeString(value: any, maxChars = 400_000): string {
+  if (value === undefined || value === null) return ""
+  if (typeof value === "string") return value.length > maxChars ? value.slice(0, maxChars) + `\n…[string truncated for metadata; original object was larger]` : value
+  try {
+    const out = JSON.stringify(value, null, 2)
+    return out.length > maxChars ? out.slice(0, maxChars) + `\n…[json truncated for metadata; original object was larger]` : out
+  } catch {
+    try { return String(value) } catch { return "" }
+  }
+}
 
-      "Legal Entity" shall mean the union of the acting entity and all
-      other entities that control, are controlled by, or are under common
-      control with that entity. For the purposes of this definition,
-      "control" means (i) the power, direct or indirect, to cause the
-      direction or management of such entity, whether by contract or
-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
-      outstanding shares, or (iii) beneficial ownership of such entity.
+function toolInputText(p: any): string {
+  return safeString(p.input ?? p.args ?? p.arguments ?? p.params ?? p.state?.input ?? p.state?.args ?? "", 500_000)
+}
 
-      "You" (or "Your") shall mean an individual or Legal Entity
-      exercising permissions granted by this License.
+function toolOutputText(p: any): string {
+  if (p.state?.status === "error") return safeString(p.state?.error ?? "", 1_000_000)
+  return safeString(p.state?.output ?? "", 5_000_000)
+}
 
-      "Source" form shall mean the preferred form for making modifications,
-      including but not limited to software source code, documentation
-      source, and configuration files.
+// Exact stringification for persistence paths. Cost/indexing can be capped,
+// but archive writes should not silently lose large tool inputs/outputs.
+function exactString(value: any): string {
+  if (value === undefined || value === null) return ""
+  if (typeof value === "string") return value
+  try { return JSON.stringify(value, null, 2) }
+  catch { try { return String(value) } catch { return "" } }
+}
 
-      "Object" form shall mean any form resulting from mechanical
-      transformation or translation of a Source form, including but
-      not limited to compiled object code, generated documentation,
-      and conversions to other media types.
+function toolInputExact(p: any): string {
+  return exactString(p.input ?? p.args ?? p.arguments ?? p.params ?? p.state?.input ?? p.state?.args ?? "")
+}
 
-      "Work" shall mean the work of authorship, whether in Source or
-      Object form, made available under the License, as indicated by a
-      copyright notice that is included in or attached to the work
-      (an example is provided in the Appendix below).
+function toolOutputExact(p: any): string {
+  if (p.state?.status === "error") return exactString(p.state?.error ?? "")
+  return exactString(p.state?.output ?? "")
+}
 
-      "Derivative Works" shall mean any work, whether in Source or Object
-      form, that is based on (or derived from) the Work and for which the
-      editorial revisions, annotations, elaborations, or other modifications
-      represent, as a whole, an original work of authorship. For the purposes
-      of this License, Derivative Works shall not include works that remain
-      separable from, or merely link (or bind by name) to the interfaces of,
-      the Work and Derivative Works thereof.
+function partCost(p: any): number {
+  if (p.type === "text" && p.text) return est(String(p.text))
+  if (p.type === "reasoning" && p.text) return est(String(p.text))
+  if (p.type === "tool") return est(toolInputText(p)) + est(toolOutputText(p))
+  return 0
+}
 
-      "Contribution" shall mean any work of authorship, including
-      the original version of the Work and any modifications or additions
-      to that Work or Derivative Works thereof, that is intentionally
-      submitted to Licensor for inclusion in the Work by the copyright owner
-      or by an individual or Legal Entity authorized to submit on behalf of
-      the copyright owner. For the purposes of this definition, "submitted"
-      means any form of electronic, verbal, or written communication sent
-      to the Licensor or its representatives, including but not limited to
-      communication on electronic mailing lists, source code control systems,
-      and issue tracking systems that are managed by, or on behalf of, the
-      Licensor for the purpose of discussing and improving the Work, but
-      excluding communication that is conspicuously marked or otherwise
-      designated in writing by the copyright owner as "Not a Contribution."
+function msgCost(msg: Message): number {
+  let t = MESSAGE_OVERHEAD
+  for (const p of msg.parts ?? []) t += partCost(p)
+  return t
+}
 
-      "Contributor" shall mean Licensor and any individual or Legal Entity
-      on behalf of whom a Contribution has been received by Licensor and
-      subsequently incorporated within the Work.
+function totalCost(msgs: Message[]): number {
+  let t = 0
+  for (const m of msgs) t += msgCost(m)
+  return t
+}
 
-   2. Grant of Copyright License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      copyright license to reproduce, prepare Derivative Works of,
-      publicly display, publicly perform, sublicense, and distribute the
-      Work and such Derivative Works in Source or Object form.
+function cloneMessages(msgs: Message[]): Message[] {
+  try { return JSON.parse(JSON.stringify(msgs)) as Message[] }
+  catch { return msgs.map(m => ({ info: { ...(m.info ?? {}) }, parts: [...(m.parts ?? [])] })) }
+}
 
-   3. Grant of Patent License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      (except as stated in this section) patent license to make, have made,
-      use, offer to sell, sell, import, and otherwise transfer the Work,
-      where such license applies only to those patent claims licensable
-      by such Contributor that are necessarily infringed by their
-      Contribution(s) alone or by combination of their Contribution(s)
-      with the Work to which such Contribution(s) was submitted. If You
-      institute patent litigation against any entity (including a
-      cross-claim or counterclaim in a lawsuit) alleging that the Work
-      or a Contribution incorporated within the Work constitutes direct
-      or contributory patent infringement, then any patent licenses
-      granted to You under this License for that Work shall terminate
-      as of the date such litigation is filed.
+function stableHash(text: string): string {
+  let h = 2166136261
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(36)
+}
 
-   4. Redistribution. You may reproduce and distribute copies of the
-      Work or Derivative Works thereof in any medium, with or without
-      modifications, and in Source or Object form, provided that You
-      meet the following conditions:
+// ============================================================================
+// Model limit detection
+// ============================================================================
+const MODEL_LIMITS: [string, number][] = [
+  ["minimax-m2.7", Number(process.env.MINIMAX_M27_CONTEXT_TOKENS ?? 196_608)], ["minimax", Number(process.env.MINIMAX_CONTEXT_TOKENS ?? 196_608)],
+  ["deepseek-r1", 128_000], ["deepseek", 128_000],
+  ["llama-3.1", 128_000], ["llama-3", 8_000],
+  ["mistral-large", 128_000], ["mistral-medium", 32_000],
+  ["qwen", 128_000], ["gpt-4.1", 1_000_000], ["gpt-4o", 128_000],
+  ["claude-3-7", 200_000], ["claude-3.7", 200_000], ["claude-4", 200_000], ["claude", 200_000],
+]
 
-      (a) You must give any other recipients of the Work or
-          Derivative Works a copy of this License; and
+function detectLimitFromMessages(msgs: Message[]): number | null {
+  for (const m of msgs) {
+    const raw = m.info?.model
+    const id = (typeof raw === "string" ? raw : raw?.id ?? raw?.name ?? raw?.model ?? "").toString().toLowerCase()
+    if (id) for (const [p, l] of MODEL_LIMITS) if (id.includes(p)) return l
+  }
+  return null
+}
 
-      (b) You must cause any modified files to carry prominent notices
-          stating that You changed the files; and
+// ============================================================================
+// File naming
+// ============================================================================
+function safeSid(sid: string): string { return sid.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 16) || "session" }
+function chunkFn(idx: number, sid: string): string { return `chunk-${String(idx).padStart(4, "0")}-${safeSid(sid).slice(0, 8)}.md` }
+function contFn(sid = "session"): string { return `continuation-${safeSid(sid).slice(0, 8)}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.md` }
+function discFn(title: string): string {
+  const s = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "note"
+  return `discovery-${s}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.md`
+}
+function overflowFn(sid = "session"): string { return `overflow-${safeSid(sid).slice(0, 8)}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.md` }
 
-      (c) You must retain, in the Source form of any Derivative Works
-          that You distribute, all copyright, patent, trademark, and
-          attribution notices from the Source form of the Work,
-          excluding those notices that do not pertain to any part of
-          the Derivative Works; and
+// ============================================================================
+// Incomplete-output heuristic
+// ============================================================================
+function looksIncomplete(text: string): boolean {
+  const t = text.trimEnd()
+  if (t.length === 0) return false
+  const bk = t.match(/```/g)
+  if (bk && bk.length % 2 !== 0) return true
+  if (/[,;:(\[{<]$/.test(t)) return true
+  if (/[a-zA-Z0-9_]$/.test(t) && !/[.!?}\]>)`'\"]$/.test(t) && !t.endsWith("\n")) {
+    const last = Math.max(t.lastIndexOf("."), t.lastIndexOf("!"), t.lastIndexOf("?"), t.lastIndexOf("\n"))
+    if (t.length - last > 240) return true
+  }
+  if (/(?:^|\n)-\s+\S.*[^.?!\n]$/.test(t.split("\n").slice(-1)[0] ?? "")) return true
+  return false
+}
 
-      (d) If the Work includes a "NOTICE" text file as part of its
-          distribution, then any Derivative Works that You distribute must
-          include a readable copy of the attribution notices contained
-          within such NOTICE file, excluding those notices that do not
-          pertain to any part of the Derivative Works, in at least one
-          of the following places: within a NOTICE text file distributed
-          as part of the Derivative Works; within the Source form or
-          documentation, if provided along with the Derivative Works; or,
-          within a display generated by the Derivative Works, if and
-          wherever such third-party notices normally appear. The contents
-          of the NOTICE file are for informational purposes only and
-          do not modify the License. You may add Your own attribution
-          notices within Derivative Works that You distribute, alongside
-          or as an addendum to the NOTICE text from the Work, provided
-          that such additional attribution notices cannot be construed
-          as modifying the License.
+// ============================================================================
+// Fast extraction
+// ============================================================================
+const FILE_RE = /(?:src|lib|test|tests|app|components|pages|api|utils|hooks|types|models|services|config|scripts|prisma|migrations|cmd|internal|pkg|packages|apps|server|client)\/[\w./-]+\.\w{1,12}/g
+const LOOSE_FILE_RE = /[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|rb|java|kt|swift|c|cc|cpp|h|hpp|css|scss|html|json|jsonc|yaml|yml|toml|md|mdx|sql|prisma|graphql|proto|sh|bash|zsh|env|lock)/g
 
-      You may add Your own copyright statement to Your modifications and
-      may provide additional or different license terms and conditions
-      for use, reproduction, or distribution of Your modifications, or
-      for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the Work otherwise complies with
-      the conditions stated in this License.
+function extractFiles(text: string): string[] {
+  const s = new Set<string>()
+  for (const m of text.matchAll(FILE_RE)) s.add(m[0])
+  for (const m of text.matchAll(LOOSE_FILE_RE)) if (!s.has(m[0])) s.add(m[0])
+  return [...s].slice(0, 30)
+}
 
-   5. Submission of Contributions. Unless You explicitly state otherwise,
-      any Contribution intentionally submitted for inclusion in the Work
-      by You to the Licensor shall be under the terms and conditions of
-      this License, without any additional terms or conditions.
-      Notwithstanding the above, nothing herein shall supersede or modify
-      the terms of any separate license agreement you may have executed
-      with Licensor regarding such Contributions.
+function extractTools(msgs: Message[]): string[] {
+  const s = new Set<string>()
+  for (const m of msgs) for (const p of m.parts ?? []) if (p.type === "tool" && p.tool) s.add(String(p.tool))
+  return [...s]
+}
 
-   6. Trademarks. This License does not grant permission to use the trade
-      names, trademarks, service marks, or product names of the Licensor,
-      except as required for reasonable and customary use in describing the
-      origin of the Work and reproducing the content of the NOTICE file.
+const STOP_WORDS = new Set([
+  "function", "return", "export", "import", "default", "class", "const", "let", "var", "async", "await", "static", "public", "private", "extends", "implements", "interface", "type", "enum", "namespace", "module", "from", "require", "include", "define", "else", "for", "while", "switch", "case", "break", "continue", "try", "catch", "finally", "throw", "new", "delete", "typeof", "instanceof", "void", "null", "undefined", "true", "false", "this", "self", "super", "that",
+  "which", "where", "there", "their", "would", "could", "should", "about", "after", "before", "think", "know", "want", "need", "have", "has", "been", "being", "will", "just", "like", "only", "very", "more", "some", "such", "other", "now", "then", "them", "these", "those", "with", "into", "out", "over", "under", "above", "below", "between", "each", "every", "both", "many", "much", "most", "thing", "used", "using", "make", "made", "take", "took", "give", "gave", "first", "last", "next", "well", "back", "even", "also", "still", "always", "never", "often", "right", "left", "down", "here", "your", "youre", "cant", "wont", "dont", "doesnt", "didnt", "isnt", "arent", "wasnt", "werent", "hasnt", "havent", "hadnt", "shouldnt", "wouldnt", "couldnt",
+])
 
-   7. Disclaimer of Warranty. Unless required by applicable law or
-      agreed to in writing, Licensor provides the Work (and each
-      Contributor provides its Contributions) on an "AS IS" BASIS,
-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-      implied, including, without limitation, any warranties or conditions
-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-      PARTICULAR PURPOSE. You are solely responsible for determining the
-      appropriateness of using or redistributing the Work and assume any
-      risks associated with Your exercise of permissions under this License.
+function allMessageText(msgs: Message[], max = 1_500_000): string {
+  let out = ""
+  for (const m of msgs) {
+    for (const p of m.parts ?? []) {
+      if (p.type === "text" && p.text) out += "\n" + String(p.text)
+      else if (p.type === "reasoning" && p.text) out += "\n" + String(p.text)
+      else if (p.type === "tool") out += "\n" + [p.tool, toolInputText(p), toolOutputText(p)].join("\n")
+      if (out.length > max) return out.slice(0, max)
+    }
+  }
+  return out
+}
 
-   8. Limitation of Liability. In no event and under no legal theory,
-      whether in tort (including negligence), contract, or otherwise,
-      unless required by applicable law (such as deliberate and grossly
-      negligent acts) or agreed to in writing, shall any Contributor be
-      liable to You for damages, including any direct, indirect, special,
-      incidental, or consequential damages of any character arising as a
-      result of this License or out of the use or inability to use the
-      Work (including but not limited to damages for loss of goodwill,
-      work stoppage, computer failure or malfunction, or any and all
-      other commercial damages or losses), even if such Contributor
-      has been advised of the possibility of such damages.
+function extractChunkKeywords(msgs: Message[]): string[] {
+  const allText = allMessageText(msgs)
+  const keywords = new Set<string>()
 
-   9. Accepting Warranty or Additional Liability. While redistributing
-      the Work or Derivative Works thereof, You may choose to offer,
-      and charge a fee for, acceptance of support, warranty, indemnity,
-      or other liability obligations and/or rights consistent with this
-      License. However, in accepting such obligations, You may act only
-      on Your own behalf and on Your sole responsibility, not on behalf
-      of any other Contributor, and only if You agree to indemnify,
-      defend, and hold each Contributor harmless for any liability
-      incurred by, or claims asserted against, such Contributor by reason
-      of your accepting any such warranty or additional liability.
+  for (const m of allText.matchAll(FILE_RE)) keywords.add(m[0].toLowerCase())
+  for (const m of allText.matchAll(LOOSE_FILE_RE)) keywords.add(m[0].toLowerCase())
+  for (const m of allText.matchAll(/[a-z][a-z0-9]+[A-Z][a-zA-Z0-9]*/g)) keywords.add(m[0])
+  for (const m of allText.matchAll(/[a-z][a-z0-9]*_[a-z][a-z0-9]*/g)) keywords.add(m[0])
+  const pascalSkip = new Set(["This", "That", "These", "Those", "Some", "More", "Less", "Most", "Then", "When", "Where", "There", "Here", "Boolean", "String", "Number", "Object"])
+  for (const m of allText.matchAll(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g)) if (!pascalSkip.has(m[0])) keywords.add(m[0])
+  for (const m of allText.matchAll(/\/[a-z][a-z0-9_-]*(?:\/[a-z][a-z0-9_-]*)*/g)) if (m[0].length >= 4) keywords.add(m[0])
+  for (const m of allText.matchAll(/(?:Error|Exception|Err|Fail|Failure)[A-Za-z0-9_-]+/g)) keywords.add(m[0])
+  for (const m of allText.matchAll(/[A-Z]+_[A-Z0-9_]+/g)) if (m[0].length >= 4) keywords.add(m[0])
+  for (const m of allText.matchAll(/v?\d+\.\d+(?:\.\d+)?/g)) keywords.add(m[0])
+  for (const m of allText.matchAll(/#\d+/g)) keywords.add(m[0])
 
-   END OF TERMS AND CONDITIONS
+  const significant = allText.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/)
+    .filter(w => w.length >= 5 && !STOP_WORDS.has(w) && !/^\d+$/.test(w))
+  for (const w of significant) {
+    if (/\d/.test(w) || /(izer$|tion$|ing$|able$|ible$|ment$|ness$|er$|or$|cache$|state$|config$|client$|server$|route$|handler$|manager$|service$)/.test(w) || keywords.size < MAX_CHUNK_KEYWORDS + 12) keywords.add(w)
+  }
 
-   APPENDIX: How to apply the Apache License to your work.
+  const arr = [...keywords]
+  const filePaths = arr.filter(k => k.includes("/") || k.includes(".") || k.startsWith("."))
+  const endpoints = arr.filter(k => k.startsWith("/"))
+  const caps = arr.filter(k => /^[A-Z]/.test(k) && !filePaths.includes(k))
+  const camel = arr.filter(k => /[A-Z]/.test(k) && !caps.includes(k) && !filePaths.includes(k))
+  const rest = arr.filter(k => !filePaths.includes(k) && !endpoints.includes(k) && !caps.includes(k) && !camel.includes(k))
+  return [...new Set([...filePaths, ...endpoints, ...caps, ...camel, ...rest])].slice(0, MAX_CHUNK_KEYWORDS)
+}
 
-      To apply the Apache License to your work, attach the following
-      boilerplate notice, with the fields enclosed by brackets "[]"
-      replaced with your own identifying information. (Don't include
-      the brackets!)  The text should be enclosed in the appropriate
-      comment syntax for the file format. We also recommend that a
-      file or class name and description of purpose be included on the
-      same "printed page" as the copyright notice for easier
-      identification within third-party archives.
+// ============================================================================
+// Summaries and index
+// ============================================================================
+function generateSectionSummary(msgs: Message[]): string {
+  const entries: string[] = []
+  let currentUserIntent = ""
+  let assistantActions: string[] = []
+  let assistantOutputs: string[] = []
 
-   Copyright [yyyy] [name of copyright owner]
+  function flush() {
+    if (!currentUserIntent && assistantActions.length === 0 && assistantOutputs.length === 0) return
+    let line = currentUserIntent
+    if (assistantActions.length > 0) line += (line ? " → " : "") + assistantActions.slice(0, 6).join(", ")
+    if (assistantOutputs.length > 0) {
+      const out = assistantOutputs.join(" ")
+      line += (line ? " | " : "") + (out.length > 180 ? out.slice(0, 177) + "…" : out)
+    }
+    if (line) entries.push(line)
+    currentUserIntent = ""
+    assistantActions = []
+    assistantOutputs = []
+  }
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+  for (const msg of msgs) {
+    if (msg.info?.role === "user") {
+      flush()
+      for (const p of msg.parts ?? []) {
+        if (p.type === "text" && p.text && !p.synthetic) {
+          const t = String(p.text).trim().replace(/\n+/g, " ")
+          if (!t.startsWith("=>") && !t.includes("Context Archive") && !t.includes("CONTINUATION")) currentUserIntent = t.length > 160 ? t.slice(0, 157) + "…" : t
+          break
+        }
+      }
+    } else if (msg.info?.role === "assistant") {
+      for (const p of msg.parts ?? []) {
+        if (p.type === "tool") assistantActions.push(`${p.tool ?? "?"}${p.state?.title ? `(${String(p.state.title).slice(0, 30)})` : ""}`)
+        if (p.type === "text" && p.text && !p.synthetic) {
+          const t = String(p.text).trim().replace(/\n+/g, " ")
+          if (t.length > 10 && !/^(I'll|I’ll|Let me|Sure|OK|Okay|Got it|I see)/i.test(t)) assistantOutputs.push(t.length > 120 ? t.slice(0, 117) + "…" : t)
+        }
+      }
+    }
+  }
+  flush()
+  return entries.slice(-SECTION_MAX_ENTRIES).map((e, i) => `[${i + 1}] ${e}`).join("\n")
+}
 
-       http://www.apache.org/licenses/LICENSE-2.0
+function trimRunningSummary(summary: string, maxChars: number): string {
+  if (summary.length <= maxChars) return summary
+  let trimmed = summary.slice(summary.length - Math.floor(maxChars * 0.9))
+  const firstNl = trimmed.indexOf("\n")
+  if (firstNl > 0 && firstNl < 180) trimmed = trimmed.slice(firstNl + 1)
+  return trimmed.trim()
+}
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+function buildEntry(file: string, msgs: Message[], sessionID: string, kind: IndexEntry["kind"] = "chunk"): IndexEntry {
+  const t = allMessageText(msgs)
+  return {
+    file,
+    summary: extractTopic(msgs),
+    files: extractFiles(t),
+    tools: extractTools(msgs),
+    msgCount: msgs.length,
+    ts: new Date().toISOString(),
+    sessionID,
+    kind,
+    keywords: extractChunkKeywords(msgs),
+  }
+}
+
+function extractTopic(msgs: Message[]): string {
+  const bits: string[] = []
+  for (const m of msgs) {
+    if (bits.length >= 3) break
+    if (m.info?.role === "user") {
+      for (const p of m.parts ?? []) {
+        if (p.type === "text" && p.text && !p.synthetic) {
+          bits.push(String(p.text).trim().replace(/\n+/g, " ").slice(0, 110))
+          break
+        }
+      }
+    }
+  }
+  return bits.join(" → ").slice(0, 240) || "Archived context"
+}
+
+function sessionEntries(entries: IndexEntry[], sid: string, includeGlobal = true): IndexEntry[] {
+  return entries.filter(e => e.sessionID === sid || (includeGlobal && (!e.sessionID || e.sessionID === "global")))
+}
+
+function fmtIndex(entries: IndexEntry[]): string {
+  const visible = entries.filter(e => !e.hidden)
+  if (visible.length === 0) return "(no archives)"
+  return visible.slice(-MAX_INDEX_SHOWN).map(e => {
+    const f = e.files.length > 0 ? ` 📄${e.files.slice(0, 4).join(",")}` : ""
+    const t = e.tools.length > 0 ? ` 🔧${e.tools.slice(0, 4).join(",")}` : ""
+    const s = e.sessionID ? ` [${e.sessionID.slice(0, 8)}]` : ""
+    return `- \`${e.file}\`${s} ${e.msgCount}msg${f}${t} — ${e.summary}`
+  }).join("\n")
+}
+
+function fmtIndexForTool(entries: IndexEntry[], includeHidden = false): string {
+  const visible = includeHidden ? entries : entries.filter(e => !e.hidden)
+  if (visible.length === 0) return "(no matching archives)"
+  return visible.slice(-MAX_INDEX_SHOWN).map(e => {
+    const hidden = e.hidden ? " hidden" : ""
+    const sess = e.sessionID ? ` session=${e.sessionID}` : ""
+    const f = e.files.length > 0 ? ` files=${e.files.slice(0, 5).join(",")}` : ""
+    const t = e.tools.length > 0 ? ` tools=${e.tools.slice(0, 4).join(",")}` : ""
+    const k = e.keywords?.length ? ` keywords=${e.keywords.slice(0, 10).join(",")}` : ""
+    return `- ${e.file}${hidden}${sess}${f}${t}${k}\n  ${e.summary}`
+  }).join("\n")
+}
+
+// ============================================================================
+// Markdown builders
+// ============================================================================
+function fenced(text: string, lang = ""): string {
+  let fence = "```"
+  while (text.includes(fence)) fence += "`"
+  return `${fence}${lang}\n${text}\n${fence}`
+}
+
+function summarizeTruncatedContent(raw: string, headChars: number, tailChars: number, archiveFile: string): string {
+  const head = raw.slice(0, headChars)
+  const tail = tailChars > 0 ? raw.slice(-tailChars) : ""
+  const files = extractFiles(raw)
+  const parts: string[] = [`Full exact content saved as ${archiveFile}. Use search_context/read_context_archive for exact slices.`]
+  if (files.length > 0) parts.push(`Referenced files: ${files.slice(0, 12).join(", ")}`)
+  parts.push("— Beginning preview —", head.length > 1800 ? head.slice(0, 1800) + "…" : head)
+  if (tail) parts.push("— End preview —", tail.length > 1400 ? "…" + tail.slice(-1400) : tail)
+  return parts.join("\n")
+}
+
+function buildChunkMd(msgs: Message[], idx: number, sid: string, limit: number): string {
+  const L: string[] = [
+    `# Context Archive — Chunk ${idx}`,
+    "",
+    "| | |",
+    "|---|---|",
+    `| **Session** | \`${sid.slice(0, 32)}\` |`,
+    `| **Archived** | ${new Date().toISOString()} |`,
+    `| **Messages** | ${msgs.length} |`,
+    `| **Limit** | ${limit.toLocaleString()} tok |`,
+    `> read_context_archive({ filename: "${chunkFn(idx, sid)}" })`,
+    "",
+    "---",
+    "",
+  ]
+
+  for (const msg of msgs) {
+    const label = msg.info?.role === "assistant" ? "🤖 **Assistant**" : "👤 **User**"
+    const content: string[] = []
+    for (const p of msg.parts ?? []) {
+      if (p.synthetic) continue
+      if (p.type === "text" && p.text && !p.ignored) content.push(String(p.text).trim())
+      if (p.type === "reasoning" && p.text) content.push(`*[Reasoning summary]* ${String(p.text).slice(0, 1200)}`)
+      if (p.type === "tool") {
+        const name = p.tool ?? "?"
+        const input = toolInputExact(p)
+        content.push(`**Tool \`${name}\`**${p.state?.title ? ` → ${p.state.title}` : ""}${p.state?.status ? ` (${p.state.status})` : ""}`)
+        if (input.trim()) content.push("**Tool input/args**\n" + fenced(input, "json"))
+        if (p.state?.status === "completed") {
+          const out = toolOutputExact(p)
+          if (out.trim()) content.push("**Tool output**\n" + fenced(out))
+        } else if (p.state?.status === "error") {
+          const err = toolOutputExact(p) || "error"
+          content.push("**Tool error**\n" + fenced(err))
+        } else {
+          content.push("**Tool status** *(incomplete/running)*")
+        }
+      }
+    }
+    if (content.length > 0) L.push(`## ${label}`, "", content.join("\n\n"), "", "---", "")
+  }
+  return L.join("\n")
+}
+
+function buildOverflowMd(originalText: string, type: string, description: string): string {
+  return [
+    `# Overflow Content — ${type}`,
+    "",
+    `Saved: ${new Date().toISOString()}`,
+    description ? `Description: ${description}` : "",
+    "",
+    "This file stores exact content removed from the live prompt. It is safe to search or read in capped slices.",
+    "",
+    "---",
+    "",
+    originalText,
+  ].filter(Boolean).join("\n")
+}
+
+// ============================================================================
+// Write queue
+// ============================================================================
+class WQ {
+  private q = Promise.resolve()
+  push(fn: () => Promise<void>) {
+    this.q = this.q.then(fn).catch(e => console.error("[CtxPlugin] write:", e))
+  }
+  async flush() { await this.q }
+}
+
+// ============================================================================
+// Plugin
+// ============================================================================
+export const ContextWindowPlugin: Plugin = async (ctx) => {
+  const dir = join(ctx.directory, ARCHIVE_SUBDIR)
+  const serverUrl = (ctx as any).serverUrl ?? process.env.OPENCODE_SERVER_URL ?? "http://127.0.0.1:4096"
+  const ensureDir = () => mkdir(dir, { recursive: true })
+  const wq = new WQ()
+
+  const auth: Record<string, string> = process.env.OPENCODE_SERVER_PASSWORD
+    ? { Authorization: `Basic ${Buffer.from(`${process.env.OPENCODE_SERVER_USERNAME ?? "opencode"}:${process.env.OPENCODE_SERVER_PASSWORD}`).toString("base64")}` }
+    : {}
+
+  const sessionLimits = new Map<string, number>()
+  let chunkCounter = 0
+  const boundaries = new Map<string, string>()
+  const runningSummaries = new Map<string, string>()
+  const indexEntries: IndexEntry[] = []
+  const continuationCounts = new Map<string, number>()
+  const readsThisTurn = new Map<string, number>()
+  const accumulator = new Map<string, string>()
+  const checkingFinish = new Set<string>()
+  const pendingContinuation = new Set<string>()
+  const lastContinuationHash = new Map<string, string>()
+  const lastContinuationAt = new Map<string, number>()
+  const partTextCache = new Map<string, string>()
+  const archivingSessions = new Set<string>()
+  const autoRetrievalCache = new Map<string, { queryHash: string; block: string | null }>()
+  const PART_TEXT_CACHE_MAX = 1000
+
+  async function atomicWrite(path: string, data: string) {
+    await ensureDir()
+    const tmp = `${path}.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`
+    await writeFile(tmp, data, "utf-8")
+    await rename(tmp, path)
+  }
+
+  function persistedState(): PersistedState {
+    const b: Record<string, string> = {}
+    const s: Record<string, string> = {}
+    for (const [k, v] of boundaries) b[k] = v
+    for (const [k, v] of runningSummaries) s[k] = v
+    return { version: 2, chunkCounter, boundaries: b, runningSummaries: s }
+  }
+
+  function saveState() {
+    wq.push(async () => {
+      await atomicWrite(join(dir, INDEX_FILE), JSON.stringify(indexEntries, null, 2))
+      await atomicWrite(join(dir, STATE_FILE), JSON.stringify(persistedState(), null, 2))
+    })
+  }
+
+  async function loadState() {
+    await ensureDir()
+    try {
+      const raw = await readFile(join(dir, INDEX_FILE), "utf-8")
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        for (const e of parsed) {
+          if (e && typeof e.file === "string") {
+            indexEntries.push({
+              file: e.file,
+              summary: String(e.summary ?? "Archived context"),
+              files: Array.isArray(e.files) ? e.files.map(String) : [],
+              tools: Array.isArray(e.tools) ? e.tools.map(String) : [],
+              msgCount: Number(e.msgCount ?? 0),
+              ts: String(e.ts ?? new Date().toISOString()),
+              sessionID: e.sessionID ? String(e.sessionID) : undefined,
+              hidden: Boolean(e.hidden),
+              kind: e.kind,
+              keywords: Array.isArray(e.keywords) ? e.keywords.map(String) : [],
+            })
+          }
+        }
+      }
+    } catch { /* first run */ }
+    try {
+      const raw = await readFile(join(dir, STATE_FILE), "utf-8")
+      const parsed = JSON.parse(raw) as Partial<PersistedState>
+      chunkCounter = Math.max(chunkCounter, Number(parsed.chunkCounter ?? 0))
+      for (const [k, v] of Object.entries(parsed.boundaries ?? {})) boundaries.set(k, String(v))
+      for (const [k, v] of Object.entries(parsed.runningSummaries ?? {})) runningSummaries.set(k, String(v))
+    } catch { /* first run */ }
+    try {
+      const known = new Set(indexEntries.map(e => e.file))
+      const files = await readdir(dir)
+      let recovered = 0
+      for (const f of files) {
+        const m = f.match(/^chunk-(\d+)/)
+        if (m) chunkCounter = Math.max(chunkCounter, +m[1])
+        if (f === INDEX_FILE || f === STATE_FILE || f === "index.md") continue
+        if (!f.endsWith(".md")) continue
+        if (known.has(f)) continue
+        // Orphan archive file — rebuild a minimal index entry so it stays reachable.
+        try {
+          const content = await readFile(join(dir, f), "utf-8")
+          const kind: IndexEntry["kind"] = f.startsWith("chunk-") ? "chunk"
+            : f.startsWith("discovery-") ? "discovery"
+            : f.startsWith("overflow-") ? "overflow"
+            : f.startsWith("continuation-") ? "continuation"
+            : "chunk"
+          const sessionMatch = content.match(/Session:?\s*[`\s]*([\w-]{4,32})/i)
+          const headMatch = content.match(/^#\s*(.+)/m)
+          const synthMsgs: Message[] = [{ info: { role: "user" }, parts: [{ type: "text", text: content.slice(0, 200_000) }] }]
+          indexEntries.push({
+            file: f,
+            summary: (headMatch?.[1]?.trim().slice(0, 200)) || `Recovered ${kind}: ${f}`,
+            files: extractFiles(content),
+            tools: [],
+            msgCount: 0,
+            ts: new Date().toISOString(),
+            sessionID: sessionMatch?.[1] || undefined,
+            hidden: kind === "overflow" || kind === "continuation",
+            kind,
+            keywords: extractChunkKeywords(synthMsgs),
+          })
+          recovered++
+        } catch { /* unreadable archive file — skip */ }
+      }
+      if (recovered > 0) saveState()
+    } catch { /* ignored */ }
+  }
+  await loadState()
+
+  function getSummary(sid: string): string { return runningSummaries.get(sid) ?? "" }
+  function setSummary(sid: string, summary: string) { runningSummaries.set(sid, trimRunningSummary(summary, RUNNING_SUMMARY_MAX_CHARS)) }
+
+  function getLimit(sessionID: string, msgs: Message[]): number {
+    const known = sessionLimits.get(sessionID)
+    if (known && known > 0) return known
+    const detected = detectLimitFromMessages(msgs)
+    if (detected && detected > 0) {
+      sessionLimits.set(sessionID, detected)
+      return detected
+    }
+    return 32_000
+  }
+
+  async function getFinish(sid: string): Promise<string | null> {
+    try {
+      const r = await fetch(new URL(`/session/${sid}/message`, serverUrl).toString(), { headers: auth, signal: AbortSignal.timeout(8_000) })
+      if (!r.ok) return null
+      const msgs = await r.json()
+      if (!Array.isArray(msgs)) return null
+      const last = [...msgs].reverse().find((m: any) => m.info?.role === "assistant")
+      return last?.info?.finish ?? null
+    } catch { return null }
+  }
+
+  async function getLastAssistantContent(sid: string): Promise<{ text: string; hasIncompleteTool: boolean; toolNames: string[] } | null> {
+    try {
+      const r = await fetch(new URL(`/session/${sid}/message`, serverUrl).toString(), { headers: auth, signal: AbortSignal.timeout(8_000) })
+      if (!r.ok) return null
+      const msgs = await r.json()
+      if (!Array.isArray(msgs)) return null
+      const last = [...msgs].reverse().find((m: any) => m.info?.role === "assistant")
+      if (!last) return null
+      const textParts: string[] = []
+      let hasIncompleteTool = false
+      const toolNames: string[] = []
+      for (const p of last.parts ?? []) {
+        if (p.type === "text" && p.text) textParts.push(String(p.text))
+        if (p.type === "tool") {
+          toolNames.push(String(p.tool ?? "?"))
+          if (!p.state?.status || p.state?.status === "running") hasIncompleteTool = true
+        }
+      }
+      return { text: textParts.join("\n"), hasIncompleteTool, toolNames }
+    } catch { return null }
+  }
+
+  async function sendContinuation(sid: string, tail: string, cfFile: string, incompleteTools: string[] = []): Promise<boolean> {
+    const lines: string[] = []
+    if (incompleteTools.length > 0 && tail.length < 80) {
+      lines.push("[CONTINUATION — your tool call was cut off.]", `Incomplete tools: ${incompleteTools.join(", ")}. Re-issue the complete call(s).`, `Partial context was saved as ${cfFile}.`)
+    } else if (incompleteTools.length > 0) {
+      lines.push("[CONTINUATION — your response/tool call was cut off.]", "Your text ended with:", "```", tail, "```", `Incomplete tools: ${incompleteTools.join(", ")}. Continue text, then re-issue calls.`, `Partial context was saved as ${cfFile}.`)
+    } else {
+      lines.push("[CONTINUATION — your response was cut off.]", "Your text ended with:", "```", tail, "```", "Resume EXACTLY from the next character. No preamble. No repetition.", "If inside a code block, output raw code only — no new opening ```.", `Partial context was saved as ${cfFile}.`)
+    }
+    try {
+      await fetch(new URL(`/session/${sid}/prompt_async`, serverUrl).toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...auth },
+        signal: AbortSignal.timeout(12_000),
+        body: JSON.stringify({ parts: [{ type: "text", text: lines.join("\n"), synthetic: true }] }),
+      })
+      return true
+    } catch (e) {
+      console.error("[CtxPlugin] continuation request failed:", e)
+      return false
+    }
+  }
+
+  async function appendLocalIndexSummary(archiveFile: string, msgs: Message[], sid: string) {
+    const summary = generateSectionSummary(msgs) || extractTopic(msgs)
+    wq.push(async () => {
+      await ensureDir()
+      await appendFile(join(dir, "index.md"), `### ${archiveFile}\n- ${new Date().toISOString()}\n- session: ${sid}\n- ${msgs.length} msgs\n\n${summary.trim()}\n\n`, "utf-8")
+    })
+  }
+
+  async function saveOverflow(content: string, type: string, description: string, sessionID = "global", tools: string[] = []): Promise<string> {
+    const fn = overflowFn(sessionID)
+    await ensureDir()
+    await writeFile(join(dir, fn), buildOverflowMd(content, type, description), "utf-8")
+    indexEntries.push({
+      file: fn,
+      summary: `${type}: ${description.replace(/\n/g, " ").slice(0, 100)}`,
+      files: extractFiles(content),
+      tools,
+      msgCount: 0,
+      ts: new Date().toISOString(),
+      sessionID,
+      hidden: true,
+      kind: "overflow",
+      keywords: extractChunkKeywords([{ info: { role: "user" }, parts: [{ type: "text", text: content }] }]),
+    })
+    saveState()
+    return fn
+  }
+
+  function extractKeywords(text: string): string[] {
+    const fileMatches = text.match(FILE_RE) ?? []
+    const looseFileMatches = text.match(LOOSE_FILE_RE) ?? []
+    const named = [...text.matchAll(/[A-Za-z_][A-Za-z0-9_]{4,}/g)].map(m => m[0])
+    const significantWords = text.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/).filter(w => w.length > 4 && !STOP_WORDS.has(w))
+    const combined = [...fileMatches, ...looseFileMatches, ...named, ...significantWords]
+    return [...new Set(combined)].slice(0, 10)
+  }
+
+  function matchEntry(entry: IndexEntry, lq: string): boolean {
+    return entry.summary.toLowerCase().includes(lq) || entry.files.some(f => f.toLowerCase().includes(lq)) || entry.tools.some(t => t.toLowerCase().includes(lq)) || (entry.keywords ?? []).some(k => k.toLowerCase().includes(lq))
+  }
+
+  function scoreEntry(entry: IndexEntry, query: string): SearchHit | null {
+    const lq = query.toLowerCase().trim()
+    const terms = extractKeywords(query).map(t => t.toLowerCase())
+    if (!lq && terms.length === 0) return null
+    let score = 0
+    const reasons: string[] = []
+    const summary = entry.summary.toLowerCase()
+    const files = entry.files.map(f => f.toLowerCase())
+    const tools = entry.tools.map(t => t.toLowerCase())
+    const keywords = (entry.keywords ?? []).map(k => k.toLowerCase())
+    if (lq && matchEntry(entry, lq)) { score += 12; reasons.push("phrase") }
+    for (const term of terms) {
+      if (!term) continue
+      if (files.some(f => f.includes(term)) || keywords.some(k => k.includes(term))) { score += term.includes("/") || term.includes(".") ? 9 : 4; reasons.push(`hit:${term}`) }
+      if (summary.includes(term)) { score += 2; reasons.push(`summary:${term}`) }
+      if (tools.some(t => t.includes(term))) { score += 5; reasons.push(`tool:${term}`) }
+    }
+    if (score <= 0) return null
+    return { entry, score, reasons: [...new Set(reasons)].slice(0, 8) }
+  }
+
+  function searchEntries(query: string, maxResults = MAX_AUTO_RETRIEVAL_RESULTS, includeHidden = true, sid = "__all__"): SearchHit[] {
+    const entries = sid === "__all__" ? indexEntries : sessionEntries(indexEntries, sid)
+    return entries.filter(e => includeHidden || !e.hidden).map(e => scoreEntry(e, query)).filter((x): x is SearchHit => !!x).sort((a, b) => b.score - a.score || b.entry.ts.localeCompare(a.entry.ts)).slice(0, maxResults)
+  }
+
+  function safeArchiveFile(file: string): string | null {
+    const b = basename(String(file))
+    if (!b || b.includes("..") || b.includes("/") || b.includes("\\")) return null
+    if (!indexEntries.some(e => e.file === b) && b !== "index.md" && b !== INDEX_FILE && b !== STATE_FILE) return null
+    return b
+  }
+
+  async function readArchiveFile(file: string, offset = 0, maxChars = MAX_RETRIEVE_CHARS_DEFAULT): Promise<string | null> {
+    const safe = safeArchiveFile(file)
+    if (!safe) return null
+    const start = Math.max(0, Math.floor(offset || 0))
+    const cap = Math.max(1000, Math.min(MAX_RETRIEVE_CHARS_HARD, Math.floor(maxChars || MAX_RETRIEVE_CHARS_DEFAULT)))
+    try {
+      const raw = await readFile(join(dir, safe), "utf-8")
+      const slice = raw.slice(start, start + cap)
+      const prefix = start > 0 ? `…[offset ${start.toLocaleString()}]\n` : ""
+      const suffix = start + cap < raw.length ? `\n\n…[${(raw.length - start - cap).toLocaleString()} chars remain; call read_context_archive with offset ${start + cap}]` : ""
+      return prefix + slice + suffix
+    } catch { return null }
+  }
+
+  async function searchDisk(query: string, sid = "__all__", maxResults = MAX_AUTO_RETRIEVAL_RESULTS): Promise<string[]> {
+    const lq = query.toLowerCase()
+    const allowed = new Set((sid === "__all__" ? indexEntries : sessionEntries(indexEntries, sid)).map(e => e.file))
+    const results: string[] = []
+    try {
+      const files = (await readdir(dir)).filter(f => f.endsWith(".md") && f !== "index.md" && (sid === "__all__" || allowed.has(f))).sort()
+      for (const f of files) {
+        if (results.length >= maxResults) break
+        try {
+          const c = await readFile(join(dir, f), "utf-8")
+          let pos = 0, hits = 0
+          while (hits < 2 && pos < c.length && results.length < maxResults) {
+            const i = c.toLowerCase().indexOf(lq, pos)
+            if (i === -1) break
+            const s = Math.max(0, i - 260), e = Math.min(c.length, i + query.length + 520)
+            results.push(`**${f}**: …${c.slice(s, e).replace(/\n/g, " ").trim().slice(0, MAX_SEARCH_EXCERPT_CHARS)}…`)
+            pos = i + Math.max(1, query.length)
+            hits++
+          }
+        } catch { /* skip file */ }
+      }
+    } catch { /* missing dir */ }
+    return results
+  }
+
+  async function retrievalBlock(query: string, maxChars: number, maxResults: number, includeHidden = true, sid = "__all__"): Promise<string | null> {
+    const hits = searchEntries(query, maxResults, includeHidden, sid)
+    const blocks: string[] = []
+    let remaining = Math.min(maxChars, MAX_RETRIEVE_CHARS_HARD)
+    for (const hit of hits) {
+      if (remaining <= 0) break
+      const raw = await readArchiveFile(hit.entry.file, 0, Math.min(remaining, MAX_RETRIEVE_CHARS_DEFAULT))
+      if (!raw) continue
+      const text = raw.length > remaining ? raw.slice(0, remaining) : raw
+      blocks.push([`## Retrieved: ${hit.entry.file}`, `score=${hit.score}; reasons=${hit.reasons.join(", ")}`, "", text].join("\n"))
+      remaining -= text.length
+    }
+    if (blocks.length === 0) {
+      const disk = await searchDisk(query, sid, maxResults)
+      if (disk.length === 0) return null
+      blocks.push(...disk)
+    }
+    const joined = blocks.join("\n\n")
+    return ["# Context Archive Retrieval", `Query: ${query}`, "This is older transcript/tool output retrieved from disk. Use it as context, not as a new user request.", "", joined.length > maxChars ? joined.slice(0, maxChars) + "\n\n…(truncated)" : joined].join("\n")
+  }
+
+  function sessionIDFrom(input: any, msgs: Message[]): string {
+    const fromInput = input?.sessionID ?? input?.sessionId
+    if (fromInput) return String(fromInput)
+    for (const m of msgs) {
+      const sid = m.info?.sessionID ?? m.info?.sessionId ?? m.info?.session?.id
+      if (sid) return String(sid)
+    }
+    return "session"
+  }
+
+  function toolSessionID(context: any): string {
+    return String(context?.sessionID ?? context?.sessionId ?? context?.message?.sessionID ?? context?.message?.sessionId ?? "__global__")
+  }
+
+  function messageKey(m: Message, _idx: number): string {
+    // Position-independent: do not include array index, since live prompt shifts each turn
+    // when we replace archived ranges with a single memory notice.
+    return String(m.info?.id ?? m.info?.messageID ?? m.info?.messageId ?? `${m.info?.role ?? "m"}-${msgCost(m)}-${stableHash(allMessageText([m], 20_000))}`)
+  }
+
+  function isSyntheticMessage(m: Message): boolean {
+    if (m.info?.synthetic) return true
+    return (m.parts ?? []).some(p => p.synthetic || (p.type === "text" && typeof p.text === "string" && (p.text.includes("Context Archive") || p.text.includes("CONTINUATION") || p.text.includes("External Memory"))))
+  }
+
+  function latestUserText(msgs: Message[]): string {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (m.info?.role !== "user" || isSyntheticMessage(m)) continue
+      for (const p of m.parts ?? []) if (p.type === "text" && p.text && !p.synthetic) return String(p.text)
+    }
+    return ""
+  }
+
+  function syntheticUser(text: string): Message {
+    return { info: { id: `ctx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, role: "user", synthetic: true }, parts: [{ type: "text", text, synthetic: true }] }
+  }
+
+  function insertBeforeLatestUser(msgs: Message[], synthetic: Message): Message[] {
+    for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i]?.info?.role === "user" && !isSyntheticMessage(msgs[i])) return [...msgs.slice(0, i), synthetic, ...msgs.slice(i)]
+    return [synthetic, ...msgs]
+  }
+
+  function protectedStartIndex(msgs: Message[]): number {
+    let turns = 0
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.info?.role === "user" && !isSyntheticMessage(msgs[i])) {
+        turns++
+        if (turns >= PROTECTED_TAIL_TURNS) return i
+      }
+    }
+    const minMessages = Math.max(MIN_PROTECTED_TURNS * 2, 2)
+    return Math.max(0, msgs.length - minMessages)
+  }
+
+  function memoryNotice(sid: string, limit: number, currentCost: number): Message {
+    const entries = sessionEntries(indexEntries, sid)
+    const visible = entries.filter(e => !e.hidden)
+    const shown = visible.slice(-MAX_INDEX_SHOWN_IN_NOTICE)
+    const hiddenFromNotice = visible.length - shown.length
+    const summary = getSummary(sid).trim()
+    const indexBody = shown.length === 0 ? "(no archives)" : shown.map(e => {
+      const f = e.files.length > 0 ? ` 📄${e.files.slice(0, 4).join(",")}` : ""
+      const t = e.tools.length > 0 ? ` 🔧${e.tools.slice(0, 4).join(",")}` : ""
+      const s = e.sessionID ? ` [${e.sessionID.slice(0, 8)}]` : ""
+      return `- \`${e.file}\`${s} ${e.msgCount}msg${f}${t} — ${e.summary}`
+    }).join("\n")
+    const indexFooter = hiddenFromNotice > 0
+      ? `\n…${hiddenFromNotice} older archive(s) not shown — call list_context_archives() for the full set.`
+      : ""
+    const lines = [
+      "⚠ Context Archive Memory",
+      "Older conversation, large user inputs, tool calls, tool outputs, and continuations are preserved on disk in `.opencode/context/`.",
+      `Session: ${sid.slice(0, 32)} | estimated live prompt: ${currentCost.toLocaleString()} tok / limit ${limit.toLocaleString()} tok`,
+      "",
+      "Rules for avoiding context loss:",
+      "- Work from the current visible prompt, the running summary, and auto-retrieved snippets.",
+      "- Use search_context or semantic_search_context for targeted lookups.",
+      "- Use read_context_archive for exact slices of chunk/discovery/overflow files; it is capped per turn to avoid loops.",
+      "- Do not re-read huge content blindly. Search first, then read specific slices.",
+      "",
+      summary ? `## Running summary\n${summary}` : "## Running summary\n(no archived summary yet)",
+      "",
+      "## Archive index (most recent)",
+      indexBody + indexFooter,
+    ]
+    return syntheticUser(lines.join("\n"))
+  }
+
+  async function writeChunk(sid: string, limit: number, archiveable: Message[]): Promise<IndexEntry | null> {
+    if (archiveable.length === 0) return null
+    const idx = ++chunkCounter
+    const fn = chunkFn(idx, sid)
+    const md = buildChunkMd(archiveable, idx, sid, limit)
+    await atomicWrite(join(dir, fn), md)
+    const entry = buildEntry(fn, archiveable, sid, "chunk")
+    const sectionSummary = generateSectionSummary(archiveable)
+    if (sectionSummary.trim()) entry.summary = sectionSummary.split("\n")[0]?.replace(/^\[\d+\]\s*/, "") || entry.summary
+    indexEntries.push(entry)
+    const addition = sectionSummary || entry.summary
+    setSummary(sid, [getSummary(sid), addition].filter(Boolean).join("\n"))
+    saveState()
+    // Ensure chunk + index are durable together — otherwise a crash here leaves an orphan.
+    await wq.flush()
+    appendLocalIndexSummary(fn, archiveable, sid).catch(() => { })
+    return entry
+  }
+
+  async function archiveOldMessages(input: any, output: { messages: Message[] }) {
+    const msgs = output.messages ?? []
+    if (msgs.length === 0) return
+    const sid = sessionIDFrom(input, msgs)
+    if (archivingSessions.has(sid)) return
+    const limit = getLimit(sid, msgs)
+    const currentCost = totalCost(msgs)
+    const target = Math.floor(limit * ARCHIVE_THRESHOLD_PCT)
+    const partLimit = Math.min(MAX_PART_ABS_TOKENS, Math.floor(limit * MAX_PART_PCT_OF_LIMIT))
+    const hugePart = msgs.some(m => (m.parts ?? []).some(p => partCost(p) > partLimit))
+    if (currentCost < target && !hugePart) return
+
+    const protectAt = protectedStartIndex(msgs)
+    if (protectAt <= 0) return
+    let startAt = 0
+    const previousBoundary = boundaries.get(sid)
+    if (previousBoundary) {
+      const prevIdx = msgs.findIndex((m, i) => messageKey(m, i) === previousBoundary)
+      if (prevIdx >= 0) startAt = prevIdx + 1
+    }
+    const archiveEnd = Math.max(startAt, protectAt)
+    const archiveable = msgs.slice(startAt, archiveEnd).filter(m => !isSyntheticMessage(m))
+    const archiveCost = totalCost(archiveable)
+    let archivedThisTurn = false
+    if (archiveable.length > 0) {
+      const replacementCost = msgCost(memoryNotice(sid, limit, currentCost))
+      const gain = Math.max(0, archiveCost - replacementCost)
+      const gainPct = currentCost > 0 ? gain / currentCost : 0
+      if (gainPct >= MIN_ARCHIVE_GAIN_PCT || currentCost > Math.floor(limit * EMERGENCY_TARGET_PCT) || hugePart) {
+        archivingSessions.add(sid)
+        try {
+          await writeChunk(sid, limit, archiveable)
+          archivedThisTurn = true
+          const lastArchived = archiveable[archiveable.length - 1]
+          if (lastArchived) boundaries.set(sid, messageKey(lastArchived, archiveEnd - 1))
+          saveState()
+        } finally { archivingSessions.delete(sid) }
+      }
+    }
+    const boundary = boundaries.get(sid)
+    let removeThrough = protectAt
+    if (boundary) {
+      const bIdx = msgs.findIndex((m, i) => messageKey(m, i) === boundary)
+      if (bIdx >= 0) removeThrough = Math.max(removeThrough, bIdx + 1)
+    }
+    if ((boundary || archivedThisTurn) && sessionEntries(indexEntries, sid).length > 0 && removeThrough > 0) output.messages = [memoryNotice(sid, limit, currentCost), ...msgs.slice(removeThrough)]
+  }
+
+  async function trimOversizedParts(sid: string, limit: number, msgs: Message[]) {
+    const maxPartTokens = Math.min(limit * MAX_PART_PCT_OF_LIMIT, MAX_PART_ABS_TOKENS)
+    for (const msg of msgs) {
+      for (const part of msg.parts ?? []) {
+        if (part.synthetic) continue
+        if (part.type === "text" && part.text) {
+          const raw = String(part.text)
+          if (est(raw) > maxPartTokens) {
+            const maxChars = Math.max(MAX_LIVE_TEXT_PREVIEW_CHARS_FLOOR, Math.floor(maxPartTokens * CHARS_PER_TOKEN))
+            const headChars = Math.min(Math.floor(maxChars * 0.70), raw.length)
+            const tailChars = Math.min(Math.floor(maxChars * 0.30), Math.max(0, raw.length - headChars))
+            const sizeK = Math.round(raw.length / 1000)
+            const fn = await saveOverflow(raw, `Input (${sizeK}K chars)`, raw.trim().replace(/\n+/g, " ").slice(0, 120), sid)
+            part.text = [`📦 Large input trimmed (${sizeK}K chars). Exact content preserved as ${fn}.`, "", summarizeTruncatedContent(raw, headChars, tailChars, fn)].join("\n")
+          }
+        } else if (part.type === "tool") {
+          const out = toolOutputExact(part)
+          const input = toolInputExact(part)
+          const raw = out || input
+          if (raw && (est(raw) > maxPartTokens || raw.length > MAX_LIVE_TOOL_PREVIEW_CHARS * 2)) {
+            const name = String(part.tool ?? "tool")
+            const saved = [input.trim() ? `# Tool input\n${fenced(input, "json")}` : "", out.trim() ? `# Tool output\n${fenced(out)}` : ""].filter(Boolean).join("\n\n")
+            const fn = await saveOverflow(saved || raw, `Tool output ${name}`, String(part.state?.title ?? name).slice(0, 120), sid, [name])
+            const preview = summarizeTruncatedContent(raw, Math.min(12_000, Math.floor(MAX_LIVE_TOOL_PREVIEW_CHARS * 0.6)), Math.min(8_000, Math.floor(MAX_LIVE_TOOL_PREVIEW_CHARS * 0.4)), fn)
+            const placeholder = { archived: fn, note: "Large tool input/output trimmed from live prompt; exact content is archived.", preview: preview.slice(0, 2000) }
+            for (const key of ["input", "args", "arguments", "params"] as const) {
+              if (part[key] !== undefined) part[key] = placeholder
+            }
+            if (!part.state) part.state = {}
+            if (part.state.input !== undefined) part.state.input = placeholder
+            if (part.state.args !== undefined) part.state.args = placeholder
+            if (part.state?.status === "error") part.state.error = `📦 Large tool error/output trimmed. Exact content preserved as ${fn}.\n\n${preview}`
+            else part.state.output = `📦 Large tool output trimmed. Exact content preserved as ${fn}.\n\n${preview}`
+          }
+        }
+      }
+    }
+  }
+
+  async function injectAutoRetrieval(input: any, output: { messages: Message[] }) {
+    const msgs = output.messages ?? []
+    const sid = sessionIDFrom(input, msgs)
+    if (sessionEntries(indexEntries, sid).length === 0) return
+    const query = latestUserText(msgs)
+    if (!query || query.includes("Context Archive")) return
+    const queryHash = stableHash(query.slice(0, 4_000))
+    const cached = autoRetrievalCache.get(sid)
+    let block: string | null
+    if (cached && cached.queryHash === queryHash) {
+      block = cached.block
+    } else {
+      block = await retrievalBlock(query, AUTO_RETRIEVAL_MAX_CHARS, MAX_AUTO_RETRIEVAL_RESULTS, true, sid)
+      autoRetrievalCache.set(sid, { queryHash, block })
+    }
+    if (!block) return
+    const text = [
+      "⚠ Context Archive Auto-Retrieval",
+      "The following archived context appears relevant to the current request. Use it silently as context; do not repeat it unless useful.",
+      "For more exact detail, call search_context or read_context_archive with a narrow query/slice.",
+      "",
+      block,
+    ].join("\n")
+    output.messages = insertBeforeLatestUser(output.messages, syntheticUser(text))
+    readsThisTurn.set(sid, 0)
+  }
+
+  async function emergencyTrim(input: any, output: { messages: Message[] }) {
+    const msgs = output.messages ?? []
+    const sid = sessionIDFrom(input, msgs)
+    const limit = getLimit(sid, msgs)
+    const emergencyLimit = Math.floor(limit * EMERGENCY_TARGET_PCT)
+    let finalTokens = totalCost(msgs)
+    let iterations = 0
+    while (finalTokens > emergencyLimit && iterations < 30) {
+      iterations++
+      let maxPart: { msgIdx: number; partIdx: number; tokens: number } | null = null
+      for (let mi = 0; mi < msgs.length; mi++) {
+        for (let pi = 0; pi < (msgs[mi].parts?.length ?? 0); pi++) {
+          const p = msgs[mi].parts[pi]
+          const t = partCost(p)
+          if (t > MESSAGE_OVERHEAD * 2 && (!maxPart || t > maxPart.tokens)) maxPart = { msgIdx: mi, partIdx: pi, tokens: t }
+        }
+      }
+      if (!maxPart) break
+      const part = msgs[maxPart.msgIdx].parts[maxPart.partIdx]
+      const targetTokens = Math.max(500, Math.floor(maxPart.tokens * 0.45))
+      const maxChars = Math.floor(targetTokens * CHARS_PER_TOKEN)
+      if (part.type === "text" && part.text) {
+        const raw = String(part.text)
+        if (!raw.includes("Exact content preserved as") && !part.synthetic) {
+          const fn = await saveOverflow(raw, "Emergency text truncation", raw.slice(0, 120), sid)
+          part.text = raw.slice(0, Math.max(maxChars, 400)) + `\n\n📦 Emergency trim. Exact content preserved as ${fn}. Search/read slices when needed.`
+        } else part.text = raw.slice(0, Math.max(maxChars, 400))
+      } else if (part.type === "tool") {
+        const out = toolOutputExact(part)
+        const inputText = toolInputExact(part)
+        const raw = out || inputText
+        if (raw && !raw.includes("Exact content preserved as")) {
+          const saved = [inputText.trim() ? `# Tool input\n${fenced(inputText, "json")}` : "", out.trim() ? `# Tool output\n${fenced(out)}` : ""].filter(Boolean).join("\n\n") || raw
+          const fn = await saveOverflow(saved, "Emergency tool truncation", String(part.state?.title ?? part.tool ?? "tool").slice(0, 120), sid, [String(part.tool ?? "tool")])
+          const placeholder = { archived: fn, note: "Emergency-trimmed from live prompt; exact input/output is archived." }
+          for (const key of ["input", "args", "arguments", "params"] as const) {
+            if (part[key] !== undefined) part[key] = placeholder
+          }
+          if (!part.state) part.state = {}
+          if (part.state.input !== undefined) part.state.input = placeholder
+          if (part.state.args !== undefined) part.state.args = placeholder
+          part.state.output = raw.slice(0, Math.max(maxChars, 400)) + `\n\n📦 Emergency tool trim. Exact content preserved as ${fn}. Search/read slices when needed.`
+        } else if (part.state?.output) part.state.output = String(part.state.output).slice(0, Math.max(maxChars, 400))
+      }
+      finalTokens = totalCost(msgs)
+    }
+  }
+
+  async function saveContinuationSnapshot(sid: string, content: string, tools: string[]): Promise<string> {
+    const fn = contFn(sid)
+    await ensureDir()
+    await writeFile(join(dir, fn), buildOverflowMd(content, "continuation", tools.length ? `tools ${tools.join(", ")}` : "assistant continuation"), "utf-8")
+    indexEntries.push({
+      file: fn,
+      summary: `continuation: ${tools.length ? `tools ${tools.join(", ")}` : content.replace(/\n/g, " ").slice(0, 100)}`,
+      files: extractFiles(content),
+      tools,
+      msgCount: 0,
+      ts: new Date().toISOString(),
+      sessionID: sid,
+      hidden: true,
+      kind: "continuation",
+      keywords: extractChunkKeywords([{ info: { role: "assistant" }, parts: [{ type: "text", text: content }] }]),
+    })
+    saveState()
+    return fn
+  }
+
+  async function handleIdle(sid: string) {
+    if (!sid || checkingFinish.has(sid)) return
+    checkingFinish.add(sid)
+    try {
+      await new Promise(r => setTimeout(r, CONT_DELAY_MS))
+      const info = await getLastAssistantContent(sid)
+      const accumulated = accumulator.get(sid) ?? ""
+      const text = info?.text || accumulated
+      let finish = await getFinish(sid)
+      if (finish === null) {
+        await new Promise(r => setTimeout(r, 400))
+        finish = await getFinish(sid)
+      }
+      if (!text && !info?.hasIncompleteTool) { pendingContinuation.delete(sid); return }
+      const cut = finish === "length" || finish === "max_tokens" || finish === "max_output_tokens" || ((finish === null || finish === undefined) && (info?.hasIncompleteTool || (text.length > 100 && looksIncomplete(text))))
+      if (!cut) { pendingContinuation.delete(sid); return }
+      const count = continuationCounts.get(sid) ?? 0
+      if (count >= MAX_CONTINUATIONS) return
+      const tail = text.slice(-CONT_API_FALLBACK_CHARS)
+      const key = stableHash(`${finish}|${tail}|${(info?.toolNames ?? []).join(",")}`)
+      if (lastContinuationHash.get(sid) === key && Date.now() - (lastContinuationAt.get(sid) ?? 0) < 30_000) return
+      continuationCounts.set(sid, count + 1)
+      lastContinuationHash.set(sid, key)
+      lastContinuationAt.set(sid, Date.now())
+      const fn = await saveContinuationSnapshot(sid, text || "(tool call incomplete)", info?.hasIncompleteTool ? info.toolNames : [])
+      pendingContinuation.add(sid)
+      const ok = await sendContinuation(sid, tail, fn, info?.hasIncompleteTool ? info.toolNames : [])
+      if (!ok) pendingContinuation.delete(sid)
+    } finally {
+      accumulator.delete(sid)
+      checkingFinish.delete(sid)
+    }
+  }
+
+  function recordTextEvent(ev: any) {
+    const props = ev.properties ?? {}
+    const sid = String(props.sessionID ?? props.sessionId ?? props.session?.id ?? "")
+    if (!sid) return
+    const delta = props.delta ?? props.textDelta ?? props.valueDelta
+    if (typeof delta === "string" && delta) {
+      accumulator.set(sid, (accumulator.get(sid) ?? "") + delta)
+      return
+    }
+    const text = props.text ?? props.value ?? props.part?.text ?? props.part?.content
+    if (typeof text !== "string" || !text) return
+    const partID = String(props.partID ?? props.partId ?? props.part?.id ?? "single")
+    const key = `${sid}:${partID}`
+    const prev = partTextCache.get(key) ?? ""
+    const append = text.startsWith(prev) ? text.slice(prev.length) : text
+    if (append) accumulator.set(sid, (accumulator.get(sid) ?? "") + append)
+    // Re-insert to refresh insertion order, then FIFO-evict if the cache is full.
+    partTextCache.delete(key)
+    partTextCache.set(key, text)
+    if (partTextCache.size > PART_TEXT_CACHE_MAX) {
+      const oldest = partTextCache.keys().next().value
+      if (oldest !== undefined) partTextCache.delete(oldest)
+    }
+  }
+
+  function resetForUserMessage(input: any) {
+    const sid = String(input?.sessionID ?? input?.sessionId ?? input?.message?.sessionID ?? input?.message?.sessionId ?? "__global__")
+    const text = safeString(input?.message?.parts ?? input?.parts ?? input?.text ?? "", 20_000)
+    const internal = text.includes("[CONTINUATION") || text.includes("Context Archive") || text.includes("synthetic")
+    // Any real (non-synthetic) user message ALWAYS resets per-turn state — otherwise rapid
+    // chat after a long output can pin continuationCounts at MAX_CONTINUATIONS forever.
+    if (!internal) {
+      continuationCounts.delete(sid)
+      pendingContinuation.delete(sid)
+      lastContinuationHash.delete(sid)
+      readsThisTurn.set(sid, 0)
+      readsThisTurn.set("__global__", 0)
+      autoRetrievalCache.delete(sid)
+    }
+  }
+
+  const hooks: Hooks = {
+    tool: {
+      save_discovery: tool({
+        description: "Save an important finding, decision, file note, or plan to archive memory.",
+        args: {
+          title: tool.schema.string().describe("Short descriptive title"),
+          content: tool.schema.string().describe("Full content to save"),
+        },
+        async execute({ title, content }: { title: string; content: string }, context: any) {
+          const sid = toolSessionID(context)
+          await ensureDir()
+          const fn = discFn(title)
+          await writeFile(join(dir, fn), `# Discovery: ${title}\n\nSession: ${sid}\nSaved: ${new Date().toISOString()}\n\n${content}`, "utf-8")
+          const contentMsgs = [{ info: { role: "user" }, parts: [{ type: "text", text: content }] }] as Message[]
+          indexEntries.push({
+            file: fn,
+            summary: `📌 ${title} — ${content.replace(/\n/g, " ").slice(0, 100)}`,
+            files: extractFiles(content),
+            tools: [],
+            msgCount: 0,
+            ts: new Date().toISOString(),
+            sessionID: sid === "__global__" ? "global" : sid,
+            kind: "discovery",
+            keywords: extractChunkKeywords(contentMsgs),
+          })
+          saveState()
+          return `✓ Saved to .opencode/context/${fn}`
+        },
+      }),
+
+      read_context_archive: tool({
+        description: `Read an archived chunk/discovery/overflow file in capped slices. Use search_context first for huge files. Limit ${MAX_READS_PER_TURN} reads per user turn.`,
+        args: {
+          filename: tool.schema.string().describe("Archive filename from list_context_archives/search_context"),
+          offset: tool.schema.number().optional().describe("Character offset to start reading from; default 0"),
+          maxChars: tool.schema.number().optional().describe(`Max chars to return; default ${MAX_RETRIEVE_CHARS_DEFAULT}, hard cap ${MAX_RETRIEVE_CHARS_HARD}`),
+        },
+        async execute({ filename, offset, maxChars }: { filename: string; offset?: number; maxChars?: number }, context: any) {
+          const sid = toolSessionID(context)
+          const key = sid || "__global__"
+          const reads = readsThisTurn.get(key) ?? readsThisTurn.get("__global__") ?? 0
+          if (reads >= MAX_READS_PER_TURN) return `Retrieval limit reached (${MAX_READS_PER_TURN} reads this turn). Use the existing snippets or wait for the next user turn.`
+          readsThisTurn.set(key, reads + 1)
+          readsThisTurn.set("__global__", reads + 1)
+          const safe = safeArchiveFile(filename)
+          if (!safe) return `File "${filename}" not found in archive index. Call list_context_archives().`
+          const c = await readArchiveFile(safe, offset ?? 0, maxChars ?? MAX_RETRIEVE_CHARS_DEFAULT)
+          return c ?? `File "${filename}" could not be read.`
+        },
+      }),
+
+      list_context_archives: tool({
+        description: "List archived chunks and discoveries. Hidden overflow/continuation files are included only when includeHidden=true.",
+        args: { includeHidden: tool.schema.boolean().optional().describe("Include hidden overflow and continuation files") },
+        async execute({ includeHidden }: { includeHidden?: boolean }) {
+          if (indexEntries.length === 0) return "No archived files yet."
+          return `## Archive Index\n\n${fmtIndexForTool(indexEntries, Boolean(includeHidden))}`
+        },
+      }),
+
+      search_context: tool({
+        description: "Search archived chunks, discoveries, overflow files, and saved tool outputs for a keyword/file/function/error. Returns safe excerpts.",
+        args: { query: tool.schema.string().describe("Specific search term: file path, function name, error message, variable name, etc.") },
+        async execute({ query }: { query: string }, context: any) {
+          const sid = toolSessionID(context)
+          const scopedSid = sid === "__global__" ? "__all__" : sid
+          const hits = searchEntries(query, MAX_AUTO_RETRIEVAL_RESULTS * 2, true, scopedSid)
+          const idx = hits.map(h => {
+            const e = h.entry
+            const label = e.hidden ? `${e.file} (hidden ${e.kind ?? "overflow"})` : e.file
+            return `- ${label} score=${h.score} — ${e.summary}${e.files.length ? ` [${e.files.slice(0, 5).join(", ")}]` : ""}${e.keywords.length ? ` (kw: ${e.keywords.slice(0, 8).join(", ")})` : ""}`
+          })
+          const disk = await searchDisk(query, scopedSid, MAX_AUTO_RETRIEVAL_RESULTS * 2)
+          if (idx.length === 0 && disk.length === 0) return `No matches for "${query}". Try a more specific file/function/error term or list_context_archives({ includeHidden: true }).`
+          return [`## Results for "${query}"`, idx.length ? "\n### Index matches\n" + idx.join("\n") : "", disk.length ? "\n### Excerpts\n" + disk.join("\n\n") : "", "\nUse read_context_archive with filename + offset for exact slices."].filter(Boolean).join("\n")
+        },
+      }),
+
+      semantic_search_context: tool({
+        description: "Search archives using several model-chosen terms from the current conversation.",
+        args: {
+          reasoning: tool.schema.string().describe("Why these terms are relevant"),
+          terms: tool.schema.array(tool.schema.string()).describe("Specific terms, file paths, functions, class names, errors, variables"),
+        },
+        async execute({ reasoning, terms }: { reasoning: string; terms: string[] }, context: any) {
+          if (!terms || terms.length === 0) return "No search terms provided."
+          const sid = toolSessionID(context)
+          const scopedSid = sid === "__global__" ? "__all__" : sid
+          const blocks: string[] = []
+          for (const term of terms.slice(0, 8)) {
+            const block = await retrievalBlock(term, Math.floor(AUTO_RETRIEVAL_MAX_CHARS / 2), 4, true, scopedSid)
+            if (block) blocks.push(block)
+          }
+          if (blocks.length === 0) return `No matches found for: ${terms.join(", ")}. Try different terms based on the conversation.`
+          const joined = [...new Set(blocks)].join("\n\n---\n\n")
+          return ["## Semantic Search Results", `**Reasoning:** ${reasoning}`, `**Terms:** ${terms.join(", ")}`, "", joined.length > AUTO_RETRIEVAL_MAX_CHARS * 2 ? joined.slice(0, AUTO_RETRIEVAL_MAX_CHARS * 2) + "\n\n…(truncated)" : joined].join("\n")
+        },
+      }),
+    },
+
+    "chat.params": async (input: any) => {
+      const limit = input?.model?.limit?.context ?? input?.limit?.context
+      const sid = input?.sessionID ?? input?.sessionId
+      if (sid && limit && limit > 0) sessionLimits.set(String(sid), Number(limit))
+    },
+
+    "experimental.chat.system.transform": async (_input: any, output: { system: string[] }) => {
+      if (!output.system) output.system = []
+      const note = [
+        "Context archive plugin is active.",
+        "Large inputs, old conversation, tool inputs, and tool outputs may be preserved in `.opencode/context/` and surfaced as synthetic Context Archive Memory messages.",
+        "Use search_context, semantic_search_context, and read_context_archive for exact prior details instead of guessing.",
+      ].join("\n")
+      if (output.system.length > 0) output.system[0] = `${output.system[0]}\n\n${note}`
+      else output.system.push(note)
+    },
+
+    event: async ({ event }: { event: any }) => {
+      const ev = event as { type: string; properties?: any }
+      if (ev.type === "message.part.delta" || ev.type === "message.part.updated" || ev.type === "message.updated") recordTextEvent(ev)
+      if (ev.type === "session.status" && ev.properties?.status?.type === "idle") {
+        const sid = String(ev.properties.sessionID ?? ev.properties.sessionId ?? ev.properties.id ?? "")
+        if (sid) await handleIdle(sid)
+      }
+      if (ev.type === "session.idle") {
+        const sid = String(ev.properties?.sessionID ?? ev.properties?.sessionId ?? ev.properties?.id ?? "")
+        if (sid) await handleIdle(sid)
+      }
+    },
+
+    "chat.message": async (input: any) => { resetForUserMessage(input) },
+
+    "experimental.chat.messages.transform": async (input: any, output: { messages: Message[] }) => {
+      const original = (output.messages ?? []) as Message[]
+      if (original.length === 0) return
+      const msgs = cloneMessages(original)
+      output.messages = msgs
+      const sid = sessionIDFrom(input, msgs)
+      const limit = getLimit(sid, msgs)
+
+      await trimOversizedParts(sid, limit, msgs)
+      await archiveOldMessages(input, output)
+
+      // Always inject memory when the session has archives. This does not rely on the system-transform hook.
+      const hasMemory = output.messages.some(m => (m.parts ?? []).some(p => p.type === "text" && typeof p.text === "string" && p.text.includes("Context Archive Memory")))
+      if (sessionEntries(indexEntries, sid).length > 0 && !hasMemory) {
+        output.messages = insertBeforeLatestUser(output.messages, memoryNotice(sid, limit, totalCost(output.messages)))
+      }
+
+      await injectAutoRetrieval(input, output)
+      await emergencyTrim(input, output)
+    },
+
+    "experimental.session.compacting": async (_input: any, output: { context: string[]; prompt?: string }) => {
+      output.context.push([
+        "External memory is stored in `.opencode/context/`.",
+        "When compacting, preserve: active task, files modified/read, commands run, failures, pending tool-call continuations, and the fact that archived exact content can be searched/read with search_context/read_context_archive.",
+      ].join("\n"))
+    },
+
+    dispose: async () => {
+      saveState()
+      await wq.flush()
+    },
+  }
+
+  return hooks
+}
+
+export default ContextWindowPlugin
